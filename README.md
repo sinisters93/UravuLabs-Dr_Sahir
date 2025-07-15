@@ -1,12 +1,18 @@
-# React + Vite
+# Uravu Simulation Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+This React app provides a 3D globe interface using Mapbox GL JS and connects to a Flask backend to simulate water vapor extraction and device placement.
 
-Currently, two official plugins are available:
+## Features
+- Mapbox-based globe and city search
+- Scenario configuration form
+- Backend integration for simulation + ZIP download
+- Ready for deployment via Netlify
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+## Technologies
+- React + Vite
+- Mapbox GL JS
+- Flask (backend)
 
-## Expanding the ESLint configuration
+## Developed by
+Uravu Labs & Dr. Sahir Azmi
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
