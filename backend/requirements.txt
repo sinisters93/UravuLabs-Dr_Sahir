@@ -6,3 +6,4 @@ requests
 osmnx
 geopandas
 shapely
+pydantic
