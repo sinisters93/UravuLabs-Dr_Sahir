@@ -1,531 +1,442 @@
-import React, { useRef, useEffect, useState } from "react";
+import React, { useRef, useEffect, useState, useCallback } from "react";
 import mapboxgl from "mapbox-gl";
 import MapboxGeocoder from "@mapbox/mapbox-gl-geocoder";
+import * as THREE from "three";
 import {
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-  LineChart,
-  Line,
-  CartesianGrid,
-  Legend,
+  BarChart, Bar, XAxis, YAxis, Tooltip,
+  ResponsiveContainer, LineChart, Line,
+  CartesianGrid, Legend,
 } from "recharts";
-
 import "mapbox-gl/dist/mapbox-gl.css";
 import "@mapbox/mapbox-gl-geocoder/lib/mapbox-gl-geocoder.css";
 
+/** ==== CONFIG ==== */
 const BACKEND_URL = "https://uravulabs-dr-sahir.onrender.com";
-
 mapboxgl.accessToken =
   "pk.eyJ1IjoidXJhdnVsYWJzIiwiYSI6ImNtZDJwNGpxdzFnMG0ybHNqZDd6MHFrOGEifQ.I5anlhSNTyzAOJov1tFTyg";
 
+const whenStyleReady = (map, fn) => {
+  if (!map) return;
+  if (map.isStyleLoaded()) fn();
+  else map.once("style.load", fn);
+};
+
 const GlobeMap = () => {
   const mapContainerRef = useRef(null);
+  const canvasRef = useRef(null);
   const mapRef = useRef(null);
+  const markerRef = useRef(null);
+  const highlightDataRef = useRef(null);
+
   const animationRef = useRef(null);
   const rotatingRef = useRef(true);
-  const markerRef = useRef(null);
   const bearingRef = useRef(0);
   const modeRef = useRef("globe");
-  const resumeTimerRef = useRef(null);
-
-  const highlightDataRef = useRef(null); // 🔴 store highlight geojson
 
   const [selectedCity, setSelectedCity] = useState(null);
   const [startDate, setStartDate] = useState("2024-12-15");
   const [endDate, setEndDate] = useState("2024-12-20");
   const [interval, setInterval] = useState("daily");
-
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState(null);
-  const [activeLayer, setActiveLayer] = useState("satellite");
+  const [activeBase, setActiveBase] = useState("satellite");
+  const [show3D, setShow3D] = useState(false);
 
-  // === Orbit animation ===
-  const animateOrbit = () => {
-    if (rotatingRef.current && mapRef.current) {
-      if (modeRef.current === "globe") {
-        bearingRef.current += 0.05;
-        mapRef.current.jumpTo({
-          center: [0, 20],
-          zoom: 1.5,
-          pitch: 0,
-          bearing: bearingRef.current,
-        });
-      }
+  const particleArray = useRef([]);
+  const flowFrameRef = useRef(0);
+  const windSeriesRef = useRef([]);
+
+  const threeLayerId = "flux-3d-particles";
+  const threeStateRef = useRef({
+    scene: null, camera: null, renderer: null, points: null,
+    positions: null, speeds: null, headingRad: 0, num: 0,
+  });
+
+  /** Orbit animation */
+  const animateOrbit = useCallback(() => {
+    if (rotatingRef.current && mapRef.current && modeRef.current === "globe") {
+      bearingRef.current += 0.05;
+      mapRef.current.jumpTo({ center: [0, 20], zoom: 1.5, bearing: bearingRef.current });
     }
     animationRef.current = requestAnimationFrame(animateOrbit);
-  };
+  }, []);
 
-  const pauseOrbit = () => {
-    rotatingRef.current = false;
-    if (resumeTimerRef.current) clearTimeout(resumeTimerRef.current);
-    resumeTimerRef.current = setTimeout(() => {
-      if (modeRef.current === "globe") rotatingRef.current = true;
-    }, 5000);
-  };
+  /** Terrain and 3D buildings */
+  const ensureTerrain = useCallback(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    whenStyleReady(map, () => {
+      if (!map.getSource("mapbox-dem")) {
+        map.addSource("mapbox-dem", {
+          type: "raster-dem",
+          url: "mapbox://mapbox.mapbox-terrain-dem-v1",
+          tileSize: 512,
+          maxzoom: 14,
+        });
+      }
+      map.setTerrain({ source: "mapbox-dem", exaggeration: 1.2 });
+    });
+  }, []);
 
-  // === Add red boundary highlight ===
-  const addHighlightLayer = (feature) => {
-    if (!mapRef.current) return;
-    highlightDataRef.current = feature; // save for re-adding later
+  const add3DBuildings = useCallback(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    whenStyleReady(map, () => {
+      if (map.getLayer("3d-buildings") || !map.getSource("composite")) return;
+      map.addLayer({
+        id: "3d-buildings",
+        source: "composite",
+        "source-layer": "building",
+        filter: ["==", "extrude", "true"],
+        type: "fill-extrusion",
+        minzoom: 15,
+        paint: {
+          "fill-extrusion-color": "#bbb",
+          "fill-extrusion-height": ["get", "height"],
+          "fill-extrusion-base": ["get", "min_height"],
+          "fill-extrusion-opacity": 0.6,
+        },
+      }, "waterway-label");
+    });
+  }, []);
 
-    if (mapRef.current.getSource("highlight")) {
-      if (mapRef.current.getLayer("highlight-fill"))
-        mapRef.current.removeLayer("highlight-fill");
-      if (mapRef.current.getLayer("highlight-outline"))
-        mapRef.current.removeLayer("highlight-outline");
-      mapRef.current.removeSource("highlight");
+  /** Boundary highlight */
+  const addHighlightLayer = useCallback((geojson) => {
+    const map = mapRef.current;
+    if (!map || !geojson) return;
+    whenStyleReady(map, () => {
+      ["highlight-fill", "highlight-outline"].forEach(id => map.getLayer(id) && map.removeLayer(id));
+      map.getSource("highlight") && map.removeSource("highlight");
+      map.addSource("highlight", { type: "geojson", data: geojson });
+      map.addLayer({ id: "highlight-fill", type: "fill", source: "highlight", paint: { "fill-color": "rgba(255,0,0,0.12)" } });
+      map.addLayer({ id: "highlight-outline", type: "line", source: "highlight", paint: { "line-color": "#ff0000", "line-width": 2, "line-blur": 0.2 } });
+    });
+  }, []);
+
+  const fetchAndDrawBoundary = useCallback(async (name) => {
+    try {
+      const resp = await fetch(`${BACKEND_URL}/boundary?city=${encodeURIComponent(name)}`);
+      const data = await resp.json();
+      if (data?.geojson) {
+        highlightDataRef.current = data.geojson;
+        addHighlightLayer(data.geojson);
+      }
+    } catch (e) {
+      console.error("Boundary fetch failed:", e);
     }
-    mapRef.current.addSource("highlight", { type: "geojson", data: feature });
-    mapRef.current.addLayer({
-      id: "highlight-fill",
-      type: "fill",
-      source: "highlight",
-      paint: { "fill-color": "rgba(255,0,0,0.2)" },
-    });
-    mapRef.current.addLayer({
-      id: "highlight-outline",
-      type: "line",
-      source: "highlight",
-      paint: { "line-color": "red", "line-width": 2 },
-    });
-  };
+  }, [addHighlightLayer]);
 
-  // === Restore highlight after style change ===
-  const restoreHighlight = () => {
-    if (!mapRef.current || !highlightDataRef.current) return;
-    addHighlightLayer(highlightDataRef.current);
-  };
+  const restoreHighlight = useCallback(() => {
+    if (highlightDataRef.current) addHighlightLayer(highlightDataRef.current);
+  }, [addHighlightLayer]);
 
-  // === Init Map ===
+  /** 2D arrows */
+  const init2DArrows = useCallback(() => {
+    const map = mapRef.current, canvas = canvasRef.current;
+    if (!map || !canvas) return;
+    const ctx = canvas.getContext("2d");
+    const resizeCanvas = () => {
+      const rect = mapContainerRef.current.getBoundingClientRect();
+      canvas.width = rect.width; canvas.height = rect.height;
+    };
+    resizeCanvas();
+
+    const bounds = map.getBounds();
+    const N = 200;
+    particleArray.current = Array.from({ length: N }, () => ({
+      lon: bounds.getWest() + Math.random() * (bounds.getEast() - bounds.getWest()),
+      lat: bounds.getSouth() + Math.random() * (bounds.getNorth() - bounds.getSouth()),
+      age: Math.random() * 200,
+    }));
+
+    const draw = () => {
+      if (show3D) { ctx.clearRect(0, 0, canvas.width, canvas.height); requestAnimationFrame(draw); return; }
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const frames = windSeriesRef.current;
+      if (!frames?.length) { requestAnimationFrame(draw); return; }
+      const frame = frames[flowFrameRef.current % frames.length];
+      const heading = ((frame.direction_deg + 180) % 360) * (Math.PI / 180);
+      const speed = frame.speed_ms || 0;
+      const baseLen = Math.min(18, speed * 0.5);
+      const driftStep = 0.0015 + Math.min(0.004, speed * 0.0003);
+
+      particleArray.current.forEach((p) => {
+        const pos = map.project([p.lon, p.lat]);
+        const dx = baseLen * Math.sin(heading);
+        const dy = baseLen * Math.cos(heading);
+        ctx.beginPath();
+        ctx.moveTo(pos.x, pos.y);
+        ctx.lineTo(pos.x + dx, pos.y - dy);
+        ctx.strokeStyle = "rgba(0,80,220,0.28)";
+        ctx.lineWidth = 0.9;
+        ctx.stroke();
+        p.lon += driftStep * Math.sin(heading);
+        p.lat += driftStep * Math.cos(heading);
+        if (++p.age > 300) {
+          const b = map.getBounds();
+          p.lon = b.getWest() + Math.random() * (b.getEast() - b.getWest());
+          p.lat = b.getSouth() + Math.random() * (b.getNorth() - b.getSouth());
+          p.age = 0;
+        }
+      });
+      flowFrameRef.current = (flowFrameRef.current + 1) % frames.length;
+      requestAnimationFrame(draw);
+    };
+    draw();
+  }, [show3D]);
+
+  /** 3D Layer */
+  const add3DLayer = useCallback(() => {
+    const map = mapRef.current;
+    if (!map || map.getLayer("flux-3d-particles")) return;
+    const S = threeStateRef.current;
+    S.scene = new THREE.Scene(); S.camera = new THREE.Camera();
+    const geometry = new THREE.BufferGeometry();
+    const bounds = map.getBounds();
+    const num = 1800;
+    const positions = new Float32Array(num * 3);
+    for (let i = 0; i < num; i++) {
+      const lon = bounds.getWest() + Math.random() * (bounds.getEast() - bounds.getWest());
+      const lat = bounds.getSouth() + Math.random() * (bounds.getNorth() - bounds.getSouth());
+      const alt = (map.queryTerrainElevation([lon, lat]) || 0) + 40 + Math.random() * 80;
+      const m = mapboxgl.MercatorCoordinate.fromLngLat([lon, lat], alt);
+      positions.set([m.x, m.y, m.z], i * 3);
+    }
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    const material = new THREE.PointsMaterial({ color: 0x0b79d0, size: 6, transparent: true, opacity: 0.25 });
+    const points = new THREE.Points(geometry, material);
+    S.scene.add(points);
+    S.points = points;
+    S.renderer = new THREE.WebGLRenderer({ canvas: map.getCanvas(), context: map.painter.context.gl, alpha: true });
+    S.renderer.autoClear = false;
+    const customLayer = {
+      id: "flux-3d-particles", type: "custom", renderingMode: "3d",
+      render(gl, matrix) {
+        const m = new THREE.Matrix4().fromArray(matrix);
+        S.camera.projectionMatrix = m;
+        S.renderer.state.reset();
+        S.renderer.render(S.scene, S.camera);
+        map.triggerRepaint();
+      },
+    };
+    map.addLayer(customLayer, "waterway-label");
+  }, []);
+
+  const remove3DLayer = useCallback(() => {
+    const map = mapRef.current;
+    if (map.getLayer("flux-3d-particles")) map.removeLayer("flux-3d-particles");
+  }, []);
+
+  /** Map init */
   useEffect(() => {
-    mapRef.current = new mapboxgl.Map({
+    const map = new mapboxgl.Map({
       container: mapContainerRef.current,
       style: "mapbox://styles/mapbox/satellite-streets-v12",
       center: [0, 20],
       zoom: 1.5,
       projection: "globe",
     });
-
-    mapRef.current.on("load", () => {
-      mapRef.current.setFog({});
-      animateOrbit();
-
-      mapRef.current.addSource("mapbox-dem", {
-        type: "raster-dem",
-        url: "mapbox://mapbox.terrain-rgb",
-        tileSize: 512,
-        maxzoom: 14,
-      });
-      mapRef.current.setTerrain({ source: "mapbox-dem", exaggeration: 1.2 });
+    mapRef.current = map;
+    map.on("load", () => {
+      map.setFog({});
+      ensureTerrain();
+      add3DBuildings();
 
       const geocoder = new MapboxGeocoder({
-        accessToken: mapboxgl.accessToken,
-        mapboxgl: mapboxgl,
-        marker: false,
-        placeholder: "Search city…",
-        types: "country,region,place",
+        accessToken: mapboxgl.accessToken, mapboxgl, marker: false, placeholder: "Search city…", types: "place",
       });
-      mapRef.current.addControl(geocoder, "top-left");
-
+      map.addControl(geocoder, "top-left");
       geocoder.on("result", async (e) => {
         const coords = e.result.center;
-        const placeName = e.result.text;
-        setSelectedCity(placeName);
-        modeRef.current = "focus";
+        const name = e.result.text;
+        setSelectedCity(name);
         rotatingRef.current = false;
-
         if (markerRef.current) markerRef.current.remove();
-        markerRef.current = new mapboxgl.Marker({ color: "red" })
-          .setLngLat(coords)
-          .addTo(mapRef.current);
-
-        try {
-          const resp = await fetch(
-            `${BACKEND_URL}/boundary?city=${encodeURIComponent(placeName)}`
-          );
-          const geojsonResp = await resp.json();
-          if (geojsonResp && geojsonResp.geojson) {
-            addHighlightLayer(geojsonResp.geojson);
-          }
-        } catch (err) {
-          console.error("Boundary fetch failed:", err);
-        }
-
-        mapRef.current.flyTo({
-          center: coords,
-          zoom: 10,
-          pitch: 60,
-          bearing: 30,
-          speed: 0.8,
-          curve: 1.5,
-          duration: 4000,
-        });
-
-        mapRef.current.once("moveend", () => {
-          rotatingRef.current = true;
-        });
+        markerRef.current = new mapboxgl.Marker({ color: "red" }).setLngLat(coords).addTo(map);
+        await fetchAndDrawBoundary(name);
+        map.flyTo({ center: coords, zoom: 11, pitch: 60, bearing: 30, duration: 2800 });
       });
 
-      mapRef.current.on("dragstart", pauseOrbit);
-      mapRef.current.on("zoomstart", pauseOrbit);
+      map.on("style.load", () => { ensureTerrain(); add3DBuildings(); restoreHighlight(); });
+      animateOrbit();
     });
+  }, [ensureTerrain, add3DBuildings, fetchAndDrawBoundary, restoreHighlight, animateOrbit]);
 
-    return () => {
-      cancelAnimationFrame(animationRef.current);
-      if (resumeTimerRef.current) clearTimeout(resumeTimerRef.current);
-      if (mapRef.current) mapRef.current.remove();
-    };
-  }, []);
-
-  // === Run Simulation ===
+  /** Simulation */
   const runSimulation = async () => {
-    if (!selectedCity) {
-      alert("Please search and select a city first!");
-      return;
-    }
+    if (!selectedCity) return alert("Search a city first");
     setLoading(true);
     try {
-      const resp = await fetch(
-        `${BACKEND_URL}/flux?city=${encodeURIComponent(
-          selectedCity
-        )}&start_date=${startDate}&end_date=${endDate}&interval=${interval}`
-      );
+      const url = `${BACKEND_URL}/flux?city=${encodeURIComponent(selectedCity)}&start_date=${startDate}&end_date=${endDate}&interval=${interval}`;
+      const resp = await fetch(url);
       const data = await resp.json();
       setResults(data);
-    } catch (err) {
-      console.error("Backend call failed:", err);
-      setResults({ error: err.message });
+      windSeriesRef.current = data.wind_series || [];
+      show3D ? (remove3DLayer(), add3DLayer()) : init2DArrows();
+    } catch (e) {
+      console.error(e);
     } finally {
       setLoading(false);
     }
   };
 
-  // === Reset Globe ===
+  /** Reset globe */
   const resetGlobe = () => {
-    setSelectedCity(null);
-    modeRef.current = "globe";
-    rotatingRef.current = true;
-
-    mapRef.current.flyTo({
-      center: [0, 20],
-      zoom: 1.5,
-      pitch: 0,
-      bearing: 0,
-      speed: 0.8,
-      curve: 1.5,
-      duration: 3000,
-    });
-
+    const map = mapRef.current;
+    map.flyTo({ center: [0, 20], zoom: 1.5, pitch: 0, bearing: 0, duration: 2500 });
     if (markerRef.current) markerRef.current.remove();
-    if (mapRef.current.getSource("highlight")) {
-      if (mapRef.current.getLayer("highlight-fill"))
-        mapRef.current.removeLayer("highlight-fill");
-      if (mapRef.current.getLayer("highlight-outline"))
-        mapRef.current.removeLayer("highlight-outline");
-      mapRef.current.removeSource("highlight");
-    }
-    highlightDataRef.current = null;
+    ["highlight-fill", "highlight-outline"].forEach(id => map.getLayer(id) && map.removeLayer(id));
+    map.getSource("highlight") && map.removeSource("highlight");
     setResults(null);
+    setSelectedCity(null);
+    remove3DLayer();
+  };
+
+  /** Toggle 3D */
+  const toggle3D = () => {
+    const map = mapRef.current;
+    const next = !show3D;
+    setShow3D(next);
+    if (next) {
+      map.setProjection("mercator");
+      let center = [77.5946, 12.9716];
+      if (selectedCity && markerRef.current) {
+        const m = markerRef.current.getLngLat();
+        center = [m.lng, m.lat];
+      }
+      map.flyTo({ center, zoom: 12, pitch: 60, bearing: 30, duration: 1500 });
+      remove3DLayer();
+      add3DLayer();
+    } else {
+      remove3DLayer();
+      map.setProjection("globe");
+      init2DArrows();
+      map.flyTo({ pitch: 0, bearing: 0, duration: 1000 });
+    }
   };
 
   return (
-    <div style={{ position: "relative", height: "100vh", width: "100vw" }}>
+    <div style={{ height: "100vh", width: "100vw", position: "relative" }}>
       <div ref={mapContainerRef} style={{ height: "100%", width: "100%" }} />
+      <canvas ref={canvasRef} style={{
+        position: "absolute", inset: 0, pointerEvents: "none", zIndex: 2,
+        opacity: show3D ? 0 : 1, transition: "opacity 0.3s ease",
+      }} />
 
-      {/* Entry Panel */}
-      <div
-        style={{
-          position: "absolute",
-          bottom: 20,
-          left: 20,
-          background: "rgba(255,255,255,0.9)",
-          padding: "12px",
-          borderRadius: "8px",
-          width: "260px",
-          fontSize: "14px",
-        }}
-      >
+      {/* 🧭 Top-right Panel */}
+      <div style={{
+        position: "absolute", top: 10, right: 10, background: "rgba(255,255,255,0.92)",
+        padding: 8, borderRadius: 6, boxShadow: "0 1px 4px rgba(0,0,0,0.3)", zIndex: 5,
+      }}>
+        <button onClick={() => {
+          setActiveBase("satellite");
+          mapRef.current.setStyle("mapbox://styles/mapbox/satellite-streets-v12");
+        }} style={{
+          fontWeight: activeBase === "satellite" ? "bold" : "normal", marginRight: 6, cursor: "pointer",
+        }}>Satellite</button>
+        <button onClick={() => {
+          setActiveBase("streets");
+          mapRef.current.setStyle("mapbox://styles/mapbox/streets-v12");
+        }} style={{
+          fontWeight: activeBase === "streets" ? "bold" : "normal", marginRight: 6, cursor: "pointer",
+        }}>Streets</button>
+        {selectedCity && (
+          <button onClick={resetGlobe} style={{
+            background: "#0b79d0", color: "white", border: "none",
+            padding: "4px 8px", borderRadius: 4, cursor: "pointer",
+          }}>🌍 Reset</button>
+        )}
+      </div>
+
+      {/* 🧮 Bottom-left Control Panel */}
+      <div style={{
+        position: "absolute", bottom: 20, left: 20,
+        background: "rgba(255,255,255,0.95)", padding: 12,
+        borderRadius: 8, width: 300, zIndex: 5,
+      }}>
         <h4>🌫 Vapor Flux Simulation</h4>
         <div>
           <label>Interval: </label>
-          {["daily", "monthly", "yearly"].map((opt) => (
-            <button
-              key={opt}
-              onClick={() => setInterval(opt)}
-              style={{
-                margin: "5px 5px 0 0",
-                background: interval === opt ? "#0b79d0" : "#eee",
-                color: interval === opt ? "white" : "black",
-                border: "none",
-                padding: "5px 10px",
-                borderRadius: "4px",
-              }}
-            >
-              {opt}
-            </button>
+          {["daily", "monthly", "yearly"].map(opt => (
+            <button key={opt} onClick={() => setInterval(opt)} style={{
+              margin: "4px 5px 0 0",
+              background: interval === opt ? "#0b79d0" : "#eee",
+              color: interval === opt ? "white" : "black",
+              border: "none", padding: "5px 10px", borderRadius: 4, cursor: "pointer",
+            }}>{opt}</button>
           ))}
         </div>
-
-        {/* Adaptive Inputs */}
-        <div>
+        <div style={{ marginTop: 6 }}>
           <label>Start: </label>
-          {interval === "daily" && (
-            <input
-              type="date"
-              value={startDate}
-              onChange={(e) => setStartDate(e.target.value)}
-            />
-          )}
-          {interval === "monthly" && (
-            <input
-              type="month"
-              value={startDate}
-              onChange={(e) => setStartDate(e.target.value)}
-            />
-          )}
-          {interval === "yearly" && (
-            <input
-              type="number"
-              min="2000"
-              max="2100"
-              value={startDate}
-              onChange={(e) => setStartDate(e.target.value)}
-            />
-          )}
+          <input type={interval === "yearly" ? "number" : interval === "monthly" ? "month" : "date"} value={startDate} onChange={e => setStartDate(e.target.value)} />
         </div>
-
-        <div>
+        <div style={{ marginTop: 6 }}>
           <label>End: </label>
-          {interval === "daily" && (
-            <input
-              type="date"
-              value={endDate}
-              onChange={(e) => setEndDate(e.target.value)}
-            />
-          )}
-          {interval === "monthly" && (
-            <input
-              type="month"
-              value={endDate}
-              onChange={(e) => setEndDate(e.target.value)}
-            />
-          )}
-          {interval === "yearly" && (
-            <input
-              type="number"
-              min="2000"
-              max="2100"
-              value={endDate}
-              onChange={(e) => setEndDate(e.target.value)}
-            />
-          )}
+          <input type={interval === "yearly" ? "number" : interval === "monthly" ? "month" : "date"} value={endDate} onChange={e => setEndDate(e.target.value)} />
         </div>
-
-        <button
-          onClick={runSimulation}
-          style={{
-            marginTop: "10px",
-            width: "100%",
-            background: "#0b79d0",
-            color: "white",
-            border: "none",
-            padding: "8px",
-            borderRadius: "5px",
-          }}
-        >
-          {loading ? "Running..." : "Run Simulation"}
-        </button>
+        <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+          <button onClick={runSimulation} style={{
+            flex: 1, background: "#0b79d0", color: "white", border: "none",
+            padding: 8, borderRadius: 4, cursor: "pointer",
+          }}>{loading ? "Running..." : "Run Simulation"}</button>
+          <button onClick={toggle3D} style={{
+            width: 110, background: show3D ? "#6c5ce7" : "#2ecc71",
+            color: "white", border: "none", padding: 8, borderRadius: 4, cursor: "pointer",
+          }}>{show3D ? "2D Mode" : "3D Mode"}</button>
+        </div>
       </div>
 
-      {/* Results Panel */}
+      {/* 📊 Right Results Panel */}
       {results && !results.error && (
-        <div
-          style={{
-            position: "absolute",
-            bottom: 20,
-            right: 20,
-            background: "rgba(255,255,255,0.95)",
-            padding: "12px",
-            borderRadius: "8px",
-            width: "380px",
-            fontSize: "14px",
-            maxHeight: "80vh",
-            overflowY: "auto",
-          }}
-        >
+        <div style={{
+          position: "absolute", bottom: 20, right: 20,
+          background: "rgba(255,255,255,0.95)", padding: 12,
+          borderRadius: 8, width: 420, maxHeight: "80vh",
+          overflowY: "auto", zIndex: 5,
+        }}>
           <h4>📊 Simulation Results</h4>
-          <b>City:</b> {results.city} <br />
-          <b>Date:</b> {results.start_date} → {results.end_date} <br />
-          <b>Interval:</b> {results.interval} <br />
-          <b>Area:</b> {results.area_km2} km² <br />
-          <b>Mean AH:</b> {results.mean_AH_gm3} g/m³ <br />
-          <b>Total Stock:</b> {Number(results.total_stock_L).toExponential(2)} L <br />
-          <b>Net Flux:</b> {Number(results.net_flux_L).toExponential(2)} L <br />
-          <b>Demand:</b> {Number(results.demand_L).toExponential(2)} L <br />
-          <b>Ratio:</b> {(results.flux_to_demand_ratio * 100).toFixed(2)}% <br />
-          <b>Wind:</b> {results.wind_speed_ms?.toFixed(2)} m/s
-          <div style={{ height: "200px", marginTop: "10px" }}>
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart
-                data={[
-                  { name: "Net Flux", value: results.net_flux_L, type: "flux" },
-                  { name: "Demand", value: results.demand_L, type: "demand" },
-                ]}
-              >
+          <div style={{ fontSize: 13, marginBottom: 6 }}>
+            <b>{results.city}</b> ({results.interval}) <br />
+            {results.start_date} → {results.end_date}
+          </div>
+          <div>Area: {results.area_km2} km²</div>
+          <div>Mean AH: {results.mean_AH_gm3} g/m³</div>
+          <div>Total Stock: {Number(results.total_stock_L).toExponential(2)} L</div>
+          <div>Net Flux: {Number(results.net_flux_L).toExponential(2)} L</div>
+          <div>Demand: {Number(results.demand_L).toExponential(2)} L</div>
+          <div>Ratio: {(results.flux_to_demand_ratio * 100).toFixed(2)}%</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+            <span>Wind: {results.wind_speed_ms?.toFixed(2)} m/s</span>
+            {results.wind_arrow_svg && (
+              <img src={results.wind_arrow_svg} alt="wind direction" style={{ width: 28, height: 28 }} />
+            )}
+          </div>
+
+          <div style={{ marginTop: 12 }}>
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={[{ name: "Flux", value: results.net_flux_L }, { name: "Demand", value: results.demand_L }]}>
                 <XAxis dataKey="name" />
-                <YAxis tickFormatter={(val) => (val / 1e9).toFixed(1) + "B"} />
-                <Tooltip formatter={(val) => val.toExponential(2) + " L"} />
-                <Bar
-                  dataKey="value"
-                  shape={(props) => {
-                    const { x, y, width, height, payload } = props;
-                    let color = "#8884d8";
-                    if (payload.type === "flux") {
-                      color =
-                        results.net_flux_L >= results.demand_L
-                          ? "#2ecc71"
-                          : "#e74c3c";
-                    }
-                    return (
-                      <rect
-                        x={x}
-                        y={y}
-                        width={width}
-                        height={height}
-                        fill={color}
-                        rx={4}
-                      />
-                    );
-                  }}
-                />
+                <YAxis tickFormatter={v => (v / 1e9).toFixed(1) + "B"} />
+                <Tooltip formatter={v => v.toExponential(2) + " L"} />
+                <Bar dataKey="value" fill="#0b79d0" />
               </BarChart>
             </ResponsiveContainer>
           </div>
-          <div style={{ height: "220px", marginTop: "15px" }}>
-            <ResponsiveContainer width="100%" height="100%">
+
+          <div style={{ marginTop: 20 }}>
+            <ResponsiveContainer width="100%" height={200}>
               <LineChart data={results.flux_series}>
-                <CartesianGrid stroke="#ccc" strokeDasharray="5 5" />
-                <XAxis
-                  dataKey="date"
-                  tick={{ fontSize: 10 }}
-                  tickFormatter={(val) => {
-                    if (results.interval === "daily") return val;
-                    if (results.interval === "monthly") return val.slice(0, 7);
-                    if (results.interval === "yearly") return val.slice(0, 4);
-                    return val;
-                  }}
-                />
-                <YAxis tickFormatter={(val) => (val / 1e9).toFixed(1) + "B"} />
-                <Tooltip
-                  formatter={(val) => val.toExponential(2) + " L"}
-                  labelFormatter={(label) => {
-                    if (results.interval === "daily") return label;
-                    if (results.interval === "monthly") return label.slice(0, 7);
-                    if (results.interval === "yearly") return label.slice(0, 4);
-                    return label;
-                  }}
-                />
+                <CartesianGrid stroke="#ccc" strokeDasharray="3 3" />
+                <XAxis dataKey="date" />
+                <YAxis tickFormatter={v => (v / 1e9).toFixed(1) + "B"} />
+                <Tooltip formatter={v => v.toExponential(2) + " L"} />
                 <Legend />
-                <Line
-                  type="monotone"
-                  dataKey="flux_L"
-                  stroke="#1f77b4"
-                  dot={false}
-                  name={
-                    results.interval === "daily"
-                      ? "Daily Flux"
-                      : results.interval === "monthly"
-                      ? "Monthly Flux"
-                      : "Yearly Flux"
-                  }
-                />
+                <Line type="monotone" dataKey="flux_L" stroke="#2ecc71" dot={false} />
               </LineChart>
             </ResponsiveContainer>
           </div>
         </div>
       )}
-
-      {/* Error Panel */}
-      {results && results.error && (
-        <div
-          style={{
-            position: "absolute",
-            bottom: 20,
-            right: 20,
-            background: "rgba(255,200,200,0.9)",
-            padding: "10px",
-            borderRadius: "8px",
-            width: "320px",
-          }}
-        >
-          <b>Error:</b> {results.error}
-        </div>
-      )}
-
-      {/* Map Layer Toggle + Reset */}
-      <div
-        style={{
-          position: "absolute",
-          top: 10,
-          right: 10,
-          background: "rgba(255,255,255,0.85)",
-          padding: "6px",
-          borderRadius: "6px",
-          boxShadow: "0 1px 4px rgba(0,0,0,0.3)",
-          display: "flex",
-          gap: "4px",
-        }}
-      >
-        <button
-          onClick={() => {
-            mapRef.current.setStyle(
-              "mapbox://styles/mapbox/satellite-streets-v12"
-            );
-            setActiveLayer("satellite");
-            mapRef.current.once("styledata", restoreHighlight);
-          }}
-          style={{
-            margin: "2px",
-            fontWeight: activeLayer === "satellite" ? "bold" : "normal",
-          }}
-        >
-          Satellite
-        </button>
-        <button
-          onClick={() => {
-            mapRef.current.setStyle("mapbox://styles/mapbox/streets-v12");
-            setActiveLayer("streets");
-            mapRef.current.once("styledata", restoreHighlight);
-          }}
-          style={{
-            margin: "2px",
-            fontWeight: activeLayer === "streets" ? "bold" : "normal",
-          }}
-        >
-          Streets
-        </button>
-        {selectedCity && (
-          <button
-            onClick={resetGlobe}
-            style={{
-              margin: "2px",
-              background: "#0b79d0",
-              color: "white",
-              border: "none",
-              padding: "4px 8px",
-              borderRadius: "4px",
-              cursor: "pointer",
-              fontSize: "12px",
-            }}
-          >
-            🌍 Reset
-          </button>
-        )}
-      </div>
     </div>
   );
 };
