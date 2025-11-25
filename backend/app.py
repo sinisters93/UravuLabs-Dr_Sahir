@@ -1,6 +1,7 @@
 # =========================================================
-#  Uravu Backend (final version)
-#  with terrain + Numba + Redis + CORS + boundary fix
+#  Uravu Backend (union version from app1/app2/app3)
+#  - terrain + Numba + Redis + CORS + boundary fix
+#  - /flux, /boundary, /global_flux, /run, /healthz, /
 # =========================================================
 
 from flask import Flask, request, jsonify
@@ -66,17 +67,17 @@ REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
 if USE_REDIS and redis:
-    try:
-        redis_client = redis.StrictRedis(
-            host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True
-        )
-        redis_client.ping()
-        print("✅ Redis connected")
-    except Exception as e:
-        print("⚠️ Redis unavailable:", e)
-        redis_client = None
+  try:
+      redis_client = redis.StrictRedis(
+          host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True
+      )
+      redis_client.ping()
+      print("✅ Redis connected")
+  except Exception as e:
+      print("⚠️ Redis unavailable:", e)
+      redis_client = None
 else:
-    redis_client = None
+  redis_client = None
 
 # =========================================================
 # Helper Functions
@@ -90,8 +91,6 @@ def calc_AH_np(T, RH):
     return (Es * 100 * RH_frac * 2.1674) / (273.15 + T)
 
 if _USE_NUMBA:
-    from numba import njit
-
     @njit(fastmath=True, cache=True)
     def saturation_vp_nb(T):
         return 6.112 * np.exp((17.67 * T) / (T + 243.5))
@@ -108,6 +107,7 @@ def calc_AH(T, RH):
     return calc_AH_np(T, RH)
 
 def expand_dates_for_interval(start_date, end_date, interval):
+    interval = (interval or "daily").lower()
     if interval == "monthly":
         if len(start_date) == 7:
             start_date = f"{start_date}-01"
@@ -135,7 +135,11 @@ def fetch_population_wikidata(city_name):
         ORDER BY DESC(?population)
         LIMIT 1
         """
-        resp = requests.get(endpoint, params={"query": query, "format": "json"}, timeout=15)
+        resp = requests.get(
+            endpoint,
+            params={"query": query, "format": "json"},
+            timeout=15
+        )
         if resp.status_code != 200:
             return None, "sparql_fetch_failed"
         j = resp.json()
@@ -182,7 +186,7 @@ def flux_endpoint():
                 print(f"📦 Cache hit: {cache_key}")
                 return jsonify(json.loads(cached))
 
-        # Boundary
+        # Boundary (+ approx flag)
         try:
             boundary = ox.geocode_to_gdf(city, buffer_dist=0).to_crs("EPSG:4326")
             if boundary.empty:
@@ -192,8 +196,14 @@ def flux_endpoint():
             boundary = ox.geocode_to_gdf("India").to_crs("EPSG:4326")
             approx_boundary = True
 
+        # Area + centroid
         area_km2 = boundary.to_crs("EPSG:3857").geometry.area.iloc[0] / 1e6
-        centroid_geom = boundary.to_crs(epsg=3857).geometry.centroid.to_crs(epsg=4326).iloc[0]
+        centroid_geom = (
+            boundary.to_crs(epsg=3857)
+            .geometry.centroid
+            .to_crs(epsg=4326)
+            .iloc[0]
+        )
         latitude, longitude = centroid_geom.y, centroid_geom.x
 
         # Population & demand
@@ -204,18 +214,23 @@ def flux_endpoint():
 
         demand_val = demand_from_reference(pop_val, interval)
         if not demand_val:
-            fallback = {"daily": REF_DAILY_DEMAND, "monthly": REF_MONTHLY_DEMAND, "yearly": REF_YEARLY_DEMAND}
-            demand_val = fallback.get(interval)
+            fallback = {
+                "daily": REF_DAILY_DEMAND,
+                "monthly": REF_MONTHLY_DEMAND,
+                "yearly": REF_YEARLY_DEMAND,
+            }
+            demand_val = fallback.get(interval, REF_DAILY_DEMAND)
             demand_source = f"fallback_constant_{interval}"
         else:
             demand_source = f"scaled_from_{REF_CITY}_{pop_source}"
 
-        # Weather
+        # Weather (Open-Meteo archive)
         url = (
             f"https://archive-api.open-meteo.com/v1/archive?"
             f"latitude={latitude}&longitude={longitude}"
             f"&start_date={start_date}&end_date={end_date}"
-            f"&hourly=temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m"
+            f"&hourly=temperature_2m,relative_humidity_2m,"
+            f"wind_speed_10m,wind_direction_10m"
             f"&timezone=auto"
         )
         resp = requests.get(url, timeout=30)
@@ -231,6 +246,7 @@ def flux_endpoint():
         RH = np.array(df["relative_humidity_2m"], dtype=float)
         wind = np.array(df["wind_speed_10m"], dtype=float)
         wdir = np.array(df["wind_direction_10m"], dtype=float)
+
         AH = calc_AH(T, RH)
         mean_AH = float(np.nanmean(AH))
 
@@ -238,11 +254,18 @@ def flux_endpoint():
         volume_m3 = area_km2 * 1e9
         total_stock_L = mean_AH * volume_m3 / 1000.0
 
-        # Terrain
+        # Terrain elevation
         try:
-            elev_api = f"https://api.open-meteo.com/v1/elevation?latitude={latitude}&longitude={longitude}"
+            elev_api = (
+                f"https://api.open-meteo.com/v1/elevation?"
+                f"latitude={latitude}&longitude={longitude}"
+            )
             elev_resp = requests.get(elev_api, timeout=10).json()
-            elevation_m = float(elev_resp.get("elevation", [0])[0] if isinstance(elev_resp.get("elevation"), list) else elev_resp.get("elevation", 0))
+            elevation_raw = elev_resp.get("elevation", 0)
+            if isinstance(elevation_raw, list):
+                elevation_m = float(elevation_raw[0] if elevation_raw else 0.0)
+            else:
+                elevation_m = float(elevation_raw or 0.0)
         except Exception:
             elevation_m = 0.0
 
@@ -253,25 +276,34 @@ def flux_endpoint():
 
         days = pd.date_range(start=start_date, end=end_date, freq="D")
         net_flux_L = daily_flux_L * len(days)
-        ratio = net_flux_L / demand_val if demand_val else 0
+        ratio = net_flux_L / demand_val if demand_val else 0.0
 
-        # Flux series
+        # Daily flux series
         dates = pd.to_datetime(df["time"])
         daily_data = pd.DataFrame({"date": dates, "AH": AH})
         grouped = daily_data.resample("D", on="date").mean()
-        flux_series_vals = grouped["AH"].values * volume_m3 / 1000.0 * transport_eff * terrain_factor
-        flux_records = [{"date": str(d.date()), "flux_L": float(v)} for d, v in zip(grouped.index, flux_series_vals)]
+        flux_series_vals = (
+            grouped["AH"].values
+            * volume_m3
+            / 1000.0
+            * transport_eff
+            * terrain_factor
+        )
+        flux_records = [
+            {"date": str(d.date()), "flux_L": float(v)}
+            for d, v in zip(grouped.index, flux_series_vals)
+        ]
 
-        # Wind arrow
+        # Wind arrow + mean direction
         mean_dir = float(np.nanmean(wdir))
-        arrow_svg = f'''
+        arrow_svg = f"""
         <svg xmlns="http://www.w3.org/2000/svg" width="40" height="40">
           <g transform="rotate({mean_dir},20,20)">
             <line x1="20" y1="30" x2="20" y2="10" stroke="#0050dc" stroke-width="2" />
             <polygon points="15,10 25,10 20,2" fill="#0050dc"/>
           </g>
         </svg>
-        '''
+        """
         arrow_b64 = base64.b64encode(arrow_svg.encode()).decode("utf-8")
         arrow_data_url = f"data:image/svg+xml;base64,{arrow_b64}"
 
@@ -284,6 +316,7 @@ def flux_endpoint():
             "mean_AH_gm3": round(mean_AH, 2),
             "total_stock_L": round(total_stock_L, 2),
             "wind_speed_ms": float(np.nanmean(wind)),
+            "wind_dir_deg": mean_dir,
             "net_flux_L": round(net_flux_L, 2),
             "population_used": int(pop_val),
             "population_source": pop_source,
@@ -291,10 +324,14 @@ def flux_endpoint():
             "demand_source": demand_source,
             "flux_to_demand_ratio": round(ratio, 3),
             "flux_series": flux_records,
-            "wind_series": [{"speed_ms": float(s), "direction_deg": float(d)} for s, d in zip(wind, wdir)],
+            "wind_series": [
+                {"speed_ms": float(s), "direction_deg": float(d)}
+                for s, d in zip(wind, wdir)
+            ],
             "wind_arrow_svg": arrow_data_url,
             "terrain_elevation_m": elevation_m,
             "terrain_factor": round(terrain_factor, 3),
+            "approx_boundary": approx_boundary,
             "requests_cache": _REQUESTS_CACHE_ENABLED,
             "numba_enabled": _USE_NUMBA,
             "data_timestamp": pd.Timestamp.utcnow().isoformat() + "Z",
@@ -314,7 +351,46 @@ def flux_endpoint():
         return jsonify({"error": str(e)}), 500
 
 # =========================================================
-# /boundary Endpoint (with red outline fix)
+# /run POST Endpoint (for React frontend)
+# =========================================================
+@app.route("/run", methods=["POST"])
+def run_endpoint():
+    """
+    Compatible with React frontend POST payload.
+    Converts lat/lon and dates into a flux response (same as /flux).
+    For now, it builds a synthetic city name and calls /flux.
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        lat = data.get("latitude")
+        lon = data.get("longitude")
+        start_date = data.get("start_date", "2024-12-15")
+        end_date = data.get("end_date", "2024-12-20")
+        scenario = data.get("scenario", "A")  # currently unused, reserved
+        interval = data.get("interval", "daily").lower()
+        start_date, end_date = expand_dates_for_interval(start_date, end_date, interval)
+        print(f"📡 /run received lat={lat}, lon={lon}, scenario={scenario}, interval={interval}")
+
+        # Construct a pseudo-city name for OSM geocoding
+        city_name = f"Lat{round(lat, 2)}Lon{round(lon, 2)}"
+
+        # Reuse /flux logic via internal HTTP call (local)
+        internal_url = (
+            f"http://127.0.0.1:5000/flux?"
+            f"city={city_name}&start_date={start_date}&end_date={end_date}&interval={interval}"
+        )
+        response = requests.get(internal_url, timeout=60)
+        try:
+            return jsonify(response.json())
+        except Exception:
+            return jsonify({"error": "Flux endpoint did not return JSON"}), 500
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 400
+
+# =========================================================
+# /boundary Endpoint (with approx flag)
 # =========================================================
 @app.route("/boundary", methods=["GET"])
 def boundary_endpoint():
@@ -332,6 +408,7 @@ def boundary_endpoint():
         geojson = boundary.__geo_interface__
         if geojson.get("type") != "FeatureCollection":
             geojson = {"type": "FeatureCollection", "features": [geojson]}
+
         return jsonify({"geojson": geojson, "approx_boundary": approx})
     except Exception as e:
         traceback.print_exc()
@@ -352,14 +429,16 @@ def global_flux():
             grid[i, :] = calc_AH(np.array([T]), np.array([RH]))[0]
         gmin, gmax = np.min(grid), np.max(grid)
         norm = (grid - gmin) / (gmax - gmin + 1e-9)
-        return jsonify({
-            "lats": lats.tolist(),
-            "lons": lons.tolist(),
-            "ah_grid": norm.tolist(),
-            "min": float(gmin),
-            "max": float(gmax),
-            "timestamp": pd.Timestamp.utcnow().isoformat() + "Z"
-        })
+        return jsonify(
+            {
+                "lats": lats.tolist(),
+                "lons": lons.tolist(),
+                "ah_grid": norm.tolist(),
+                "min": float(gmin),
+                "max": float(gmax),
+                "timestamp": pd.Timestamp.utcnow().isoformat() + "Z",
+            }
+        )
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
@@ -369,12 +448,14 @@ def global_flux():
 # =========================================================
 @app.route("/healthz")
 def health():
-    return jsonify({
-        "status": "ok",
-        "redis": redis_client is not None,
-        "requests_cache": _REQUESTS_CACHE_ENABLED,
-        "numba_enabled": _USE_NUMBA
-    })
+    return jsonify(
+        {
+            "status": "ok",
+            "redis": redis_client is not None,
+            "requests_cache": _REQUESTS_CACHE_ENABLED,
+            "numba_enabled": _USE_NUMBA,
+        }
+    )
 
 @app.route("/")
 def home():
@@ -385,6 +466,7 @@ def home():
         <li><a href='/boundary?city=Bangalore'>/boundary?city=Bangalore</a></li>
         <li><a href='/global_flux'>/global_flux</a></li>
         <li><a href='/healthz'>/healthz</a></li>
+        <li><b>POST</b> /run (React app endpoint)</li>
     </ul>
     """
 

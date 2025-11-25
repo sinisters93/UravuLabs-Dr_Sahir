@@ -1,7 +1,7 @@
-flask
-flask-cors
-requests
-pandas
-numpy
-osmnx
-gunicorn
+Flask==3.0.3
+flask-cors==4.0.1
+requests==2.32.3
+pandas==2.2.3
+numpy==2.1.2
+osmnx==1.9.3
+redis==5.0.7
